@@ -1,252 +1,432 @@
-import * as anchor from '@coral-xyz/anchor';
-import { TOKEN_PROGRAM_ID, Token } from "@solana/spl-token";
-import * as NewToken from "new-spl-token";
-import * as utils from "./utils";
-import * as assert from "assert";
-import * as fs from 'fs';
-import { exit } from 'process';
-import { StepStaking } from "../target/types/step_staking";
+import assert from "node:assert/strict";
+import * as anchor from "@anchor-lang/core";
+import * as token from "@solana/spl-token";
+import { Fixture, TOKEN_MINT, SHARE_MINT, VAULT, VAULT_BUMP } from "./utils";
 
-let program = anchor.workspace.StepStaking as anchor.Program<StepStaking>;
+const f = new Fixture();
+async function rejectCode(promise: Promise<unknown>, code: string) {
+  await assert.rejects(
+    promise,
+    (error: any) => error.error?.errorCode?.code === code
+  );
+}
 
-//Read the provider from the configured environment.
-//represents an outside actor
-//owns mints out of any other actors control, provides initial $$ to others
-const envProvider = anchor.AnchorProvider.env();
+describe("Step staking", () => {
+  before(async () => {
+    await f.setup();
+  });
+  afterEach(async () => {
+    await f.cleanup();
+  });
 
-//we allow this convenience var to change between default env and mock user(s)
-//initially we are the outside actor
-let provider = envProvider;
-//convenience method to set in anchor AND above convenience var
-//setting in anchor allows the rpc and accounts namespaces access
-//to a different wallet from env
-function setProvider(p) {
-  provider = p;
-  anchor.setProvider(p);
-  program = new anchor.Program(program.idl, program.programId, p);
-};
-setProvider(provider);
+  it("initializes one self-authorized vault for the configured underlying mint", async () => {
+    const vault = await token.getAccount(f.provider.connection, VAULT);
+    assert.ok(vault.owner.equals(VAULT));
+    assert.ok(vault.mint.equals(TOKEN_MINT));
+    assert.equal(vault.amount, 0n);
+  });
 
-describe('step-staking', () => {
-  //hardcoded in program, read from test keys directory for testing
-  let mintKey;
-  let mintObject: Token;
-  let mintPubkey;
-  let xMintObject;
-  let xMintPubkey;
+  it("mints one-for-one shares for an empty pool", async () => {
+    const before = await f.balance(f.owner.tokens);
+    await f.stake(5_000_000_000n);
+    assert.equal(await f.balance(f.owner.tokens), before - 5_000_000_000n);
+    assert.equal(await f.balance(f.owner.shares), 5_000_000_000n);
+    assert.equal(await f.balance(VAULT), 5_000_000_000n);
+  });
 
-  //the program's vault for stored collateral against xToken minting
-  let vaultPubkey;
-  let vaultBump;
+  it("distributes added rewards proportionally on redemption", async () => {
+    const before = await f.balance(f.owner.tokens);
+    await f.stake(5_000_000_000n);
+    await f.donate(1_000_000_000n);
+    await f.unstake(5_000_000_000n);
+    assert.equal(await f.balance(f.owner.tokens), before);
+    assert.equal(await f.balance(f.owner.shares), 0n);
+    assert.equal(await f.balance(VAULT), 0n);
+  });
 
-  it('Is initialized!', async () => {
-    //setup logging event listeners
-    program.addEventListener('PriceChange', (e, s) => {
-      console.log('Price Change In Slot ', s);
-      console.log('From', e.oldStepPerXstepE9.toString());
-      console.log('From', e.oldStepPerXstep.toString());
-      console.log('To', e.newStepPerXstepE9.toString());
-      console.log('To', e.newStepPerXstep.toString());
+  it("quotes the current redemption ratio without mutating balances", async () => {
+    await f.stake(5_000_000_000n);
+    await f.donate(1_000_000_000n);
+    const result = await f.program.methods
+      .emitPrice()
+      .accountsStrict({
+        tokenMint: TOKEN_MINT,
+        xTokenMint: SHARE_MINT,
+        tokenVault: VAULT,
+      })
+      .simulate();
+    const price = result.events[0].data as any;
+    assert.equal(price.stepPerXstepE9.toString(), "1200000000");
+    assert.equal(price.stepPerXstep, "1.2");
+    assert.equal(await f.balance(VAULT), 6_000_000_000n);
+  });
+
+  it("prices later deposits at the existing reward-adjusted ratio", async () => {
+    await f.stake(1000n);
+    await f.donate(1000n);
+    await f.stake(1000n, 500n, {
+      from: f.other.tokens,
+      authority: f.other.signer,
+      to: f.other.shares,
     });
+    assert.equal(await f.balance(f.other.shares), 500n);
+    const before = await f.balance(f.other.tokens);
+    await f.unstake(500n, 1000n, {
+      from: f.other.shares,
+      authority: f.other.signer,
+      to: f.other.tokens,
+    });
+    assert.equal(await f.balance(f.other.tokens), before + 1000n);
+  });
 
-    //this already exists in ecosystem
-    //test step token hardcoded in program, mint authority is wallet for testing
-    let rawdata = fs.readFileSync('tests/keys/step-teST1ieLrLdr4MJPZ7i8mgSCLQ7rTrPRjNnyFdHFaz9.json');
-    let keyData = JSON.parse(rawdata.toString());
-    mintKey = anchor.web3.Keypair.fromSecretKey(new Uint8Array(keyData));
-    mintObject = await utils.createMint(mintKey, provider, provider.wallet.publicKey, null, 9, TOKEN_PROGRAM_ID);
-    mintPubkey = mintObject.publicKey;
+  it("keeps the original prefilled-empty-pool reward behavior", async () => {
+    await f.donate(5000n);
+    const before = await f.balance(f.owner.tokens);
+    await f.stake(5000n);
+    assert.equal(await f.balance(f.owner.shares), 5000n);
+    await f.unstake(5000n);
+    assert.equal(await f.balance(f.owner.tokens), before + 5000n);
+  });
 
-    [vaultPubkey, vaultBump] =
-      await anchor.web3.PublicKey.findProgramAddress(
-        [mintPubkey.toBuffer()],
-        program.programId
+  it("sweeps a nested associated token account into the vault and closes it", async () => {
+    const nested = await token.createAssociatedTokenAccount(
+      f.provider.connection,
+      f.payer,
+      TOKEN_MINT,
+      VAULT,
+      undefined,
+      token.TOKEN_PROGRAM_ID,
+      token.ASSOCIATED_TOKEN_PROGRAM_ID,
+      true
+    );
+    await token.transfer(
+      f.provider.connection,
+      f.payer,
+      f.owner.tokens,
+      nested,
+      f.payer,
+      1000n
+    );
+    await f.program.methods
+      .withdrawNested()
+      .accountsStrict({
+        refundee: f.payer.publicKey,
+        tokenMint: TOKEN_MINT,
+        tokenVault: VAULT,
+        tokenVaultNestedAta: nested,
+        tokenProgram: token.TOKEN_PROGRAM_ID,
+        associatedTokenProgram: token.ASSOCIATED_TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+    assert.equal(await f.provider.connection.getAccountInfo(nested), null);
+    assert.equal(await f.balance(VAULT), 1000n);
+  });
+  it("rejects zero deposits without changing receipt supply", async () => {
+    await rejectCode(f.stake(0n), "InvalidAmount");
+    assert.equal(await f.supply(), 0n);
+  });
+
+  it("rejects zero redemptions before burning or dividing", async () => {
+    await rejectCode(f.unstake(0n), "InvalidAmount");
+    assert.equal(await f.supply(), 0n);
+  });
+
+  it("rejects a zero minimum output", async () => {
+    await rejectCode(f.stake(1n, 0n), "InvalidMinimumOutput");
+  });
+
+  it("rejects a donated-pool deposit that would mint zero shares", async () => {
+    await f.stake(1n, 1n, {
+      from: f.other.tokens,
+      authority: f.other.signer,
+      to: f.other.shares,
+    });
+    await f.donate(1000n);
+    const balance = await f.balance(f.owner.tokens);
+    const vault = await f.balance(VAULT);
+    await rejectCode(f.stake(1000n, 1n), "ZeroOutput");
+    assert.equal(await f.balance(f.owner.tokens), balance);
+    assert.equal(await f.balance(f.owner.shares), 0n);
+    assert.equal(await f.balance(VAULT), vault);
+    assert.equal(await f.supply(), 1n);
+  });
+
+  it("enforces stake slippage even when the rounded output is positive", async () => {
+    await f.stake(1n, 1n, {
+      from: f.other.tokens,
+      authority: f.other.signer,
+      to: f.other.shares,
+    });
+    await f.donate(999n);
+    const before = await f.balance(f.owner.tokens);
+    await rejectCode(f.stake(1999n, 2n), "SlippageExceeded");
+    assert.equal(await f.balance(f.owner.tokens), before);
+    await f.stake(2000n, 2n);
+    assert.equal(await f.balance(f.owner.shares), 2n);
+  });
+
+  it("enforces redemption slippage without consuming shares", async () => {
+    await f.stake(1000n);
+    await rejectCode(f.unstake(1n, 2n), "SlippageExceeded");
+    assert.equal(await f.balance(f.owner.shares), 1000n);
+    assert.equal(await f.balance(VAULT), 1000n);
+  });
+
+  it("supports approved deposit delegates and a third-party share recipient", async () => {
+    await token.approve(
+      f.provider.connection,
+      f.payer,
+      f.owner.tokens,
+      f.other.signer.publicKey,
+      f.owner.signer,
+      1000n
+    );
+    await f.stake(1000n, 1000n, {
+      authority: f.other.signer,
+      to: f.recipient.shares,
+    });
+    assert.equal(await f.balance(f.recipient.shares), 1000n);
+  });
+
+  it("supports approved redemption delegates and a third-party payout recipient", async () => {
+    await f.stake(1000n);
+    await token.approve(
+      f.provider.connection,
+      f.payer,
+      f.owner.shares,
+      f.other.signer.publicKey,
+      f.owner.signer,
+      1000n
+    );
+    const before = await f.balance(f.recipient.tokens);
+    await f.unstake(1000n, 1000n, {
+      authority: f.other.signer,
+      to: f.recipient.tokens,
+    });
+    assert.equal(await f.balance(f.recipient.tokens), before + 1000n);
+  });
+
+  it("rejects unrelated redemption signers", async () => {
+    await f.stake(1000n);
+    await rejectCode(
+      f.unstake(1000n, 1n, { authority: f.other.signer, to: f.other.tokens }),
+      "InvalidTokenAuthority"
+    );
+    assert.equal(await f.balance(f.owner.shares), 1000n);
+  });
+
+  it("rejects unrelated deposit signers without minting receipts", async () => {
+    await token.revoke(
+      f.provider.connection,
+      f.payer,
+      f.owner.tokens,
+      f.owner.signer
+    );
+    const before = await f.balance(f.owner.tokens);
+    await rejectCode(
+      f.stake(1000n, 1000n, { authority: f.other.signer, to: f.other.shares }),
+      "InvalidTokenAuthority"
+    );
+    assert.equal(await f.balance(f.owner.tokens), before);
+    assert.equal(await f.balance(f.other.shares), 0n);
+    assert.equal(await f.supply(), 0n);
+  });
+
+  it("rejects insufficient delegate allowances for both trade directions", async () => {
+    await token.approve(
+      f.provider.connection,
+      f.payer,
+      f.owner.tokens,
+      f.other.signer.publicKey,
+      f.owner.signer,
+      99n
+    );
+    await rejectCode(
+      f.stake(100n, 100n, { authority: f.other.signer }),
+      "InsufficientDelegation"
+    );
+    await f.stake(100n, 100n);
+    await token.approve(
+      f.provider.connection,
+      f.payer,
+      f.owner.shares,
+      f.other.signer.publicKey,
+      f.owner.signer,
+      99n
+    );
+    await rejectCode(
+      f.unstake(100n, 100n, { authority: f.other.signer }),
+      "InsufficientDelegation"
+    );
+    assert.equal(await f.balance(f.owner.shares), 100n);
+    assert.equal(await f.balance(VAULT), 100n);
+  });
+
+  it("rejects invalid vault seeds and configured mints", async () => {
+    await rejectCode(
+      f.stake(100n, 100n, { nonce: (VAULT_BUMP + 1) % 256 }),
+      "ConstraintSeeds"
+    );
+    await rejectCode(
+      f.stake(100n, 100n, { tokenMint: SHARE_MINT }),
+      "ConstraintAddress"
+    );
+    await rejectCode(
+      f.stake(100n, 100n, { shareMint: TOKEN_MINT }),
+      "ConstraintAddress"
+    );
+    assert.equal(await f.supply(), 0n);
+    assert.equal(await f.balance(VAULT), 0n);
+  });
+
+  it("rolls back receipt issuance and burns when a token account has the wrong mint", async () => {
+    const before = await f.balance(f.owner.tokens);
+    await assert.rejects(f.stake(100n, 100n, { to: f.owner.tokens }));
+    await assert.rejects(f.stake(100n, 100n, { from: f.owner.shares }));
+    assert.equal(await f.balance(f.owner.tokens), before);
+    assert.equal(await f.supply(), 0n);
+    await f.stake(100n, 100n);
+    await assert.rejects(f.unstake(100n, 100n, { to: f.owner.shares }));
+    assert.equal(await f.balance(f.owner.shares), 100n);
+    assert.equal(await f.balance(VAULT), 100n);
+  });
+
+  it("fails closed on legacy instruction data with no minimum output", async () => {
+    const stake = await f.program.methods
+      .stake(VAULT_BUMP, new anchor.BN(100), new anchor.BN(100))
+      .accountsStrict({
+        tokenMint: TOKEN_MINT,
+        xTokenMint: SHARE_MINT,
+        tokenVault: VAULT,
+        tokenFrom: f.owner.tokens,
+        tokenFromAuthority: f.owner.signer.publicKey,
+        xTokenTo: f.owner.shares,
+        tokenProgram: token.TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+    const unstake = await f.program.methods
+      .unstake(VAULT_BUMP, new anchor.BN(100), new anchor.BN(100))
+      .accountsStrict({
+        tokenMint: TOKEN_MINT,
+        xTokenMint: SHARE_MINT,
+        tokenVault: VAULT,
+        xTokenFrom: f.owner.shares,
+        xTokenFromAuthority: f.owner.signer.publicKey,
+        tokenTo: f.owner.tokens,
+        tokenProgram: token.TOKEN_PROGRAM_ID,
+      })
+      .instruction();
+    for (const instruction of [stake, unstake]) {
+      instruction.data = instruction.data.subarray(0, -8);
+      await assert.rejects(
+        f.provider.sendAndConfirm(
+          new anchor.web3.Transaction().add(instruction)
+        ),
+        /InstructionDidNotDeserialize/
       );
+    }
+    assert.equal(await f.supply(), 0n);
+    assert.equal(await f.balance(VAULT), 0n);
+  });
 
-    //this is the new xstep token
-    //test xstep token hardcoded in program, mint authority is token vault
-    rawdata = fs.readFileSync('tests/keys/xstep-TestZ4qmw6fCo1uK9oJbobWDgj1sME6hR1ssWQnyjxM.json');
-    keyData = JSON.parse(rawdata.toString());
-    let key = anchor.web3.Keypair.fromSecretKey(new Uint8Array(keyData));
-    xMintObject = await utils.createMint(key, provider, vaultPubkey, null, 9, TOKEN_PROGRAM_ID);
-    xMintPubkey = xMintObject.publicKey;
+  it("rejects unrelated mint-authority reclaim signers", async () => {
+    await rejectCode(f.reclaim(f.other.signer), "InvalidAuthority");
+    assert.ok(
+      (
+        await token.getMint(f.provider.connection, SHARE_MINT)
+      ).mintAuthority!.equals(VAULT)
+    );
+  });
 
-    [vaultPubkey, vaultBump] =
-      await anchor.web3.PublicKey.findProgramAddress(
-        [mintPubkey.toBuffer()],
-        program.programId
+  it("allows the underlying mint authority to reclaim minting while holders can still exit", async () => {
+    await f.stake(1000n);
+    await f.reclaim();
+    try {
+      assert.ok(
+        (
+          await token.getMint(f.provider.connection, SHARE_MINT)
+        ).mintAuthority!.equals(f.payer.publicKey)
       );
+      await f.unstake(1000n, 1000n);
+      assert.equal(await f.balance(f.owner.shares), 0n);
+    } finally {
+      await token.setAuthority(
+        f.provider.connection,
+        f.payer,
+        SHARE_MINT,
+        f.payer,
+        token.AuthorityType.MintTokens,
+        VAULT
+      );
+    }
+  });
 
-    await program.rpc.initialize(
-      vaultBump,
-      {
-        accounts: {
-          tokenMint: mintPubkey,
-          xTokenMint: xMintPubkey,
-          tokenVault: vaultPubkey,
-          initializer: provider.wallet.publicKey,
-          systemProgram: anchor.web3.SystemProgram.programId,
-          tokenProgram: TOKEN_PROGRAM_ID,
-          rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-        }
-      }
+  it("completes redemption even when its new price exceeds the legacy integer range", async () => {
+    await f.stake(2n);
+    await f.donate(36_893_488_145n);
+    const before = await f.balance(f.owner.tokens);
+    await f.unstake(1n, 18_446_744_073n);
+    assert.equal(await f.balance(f.owner.tokens), before + 18_446_744_073n);
+    assert.equal(await f.balance(VAULT), 18_446_744_074n);
+  });
+
+  it("keeps the price at extreme ratios readable and the vault redeemable", async () => {
+    await f.stake(1n);
+    await f.donate(18_446_744_073n);
+    const result = await f.program.methods
+      .emitPrice()
+      .accountsStrict({
+        tokenMint: TOKEN_MINT,
+        xTokenMint: SHARE_MINT,
+        tokenVault: VAULT,
+      })
+      .simulate();
+    const price = result.events[0].data as any;
+    assert.equal(price.stepPerXstepE9.toString(), "18446744073709551615");
+    assert.equal(price.stepPerXstep, "18446744074");
+    await f.unstake(1n, 18_446_744_074n);
+    assert.equal(await f.balance(VAULT), 0n);
+  });
+
+  for (const [label, owner] of [
+    ["system", anchor.web3.SystemProgram.programId],
+    [
+      "incinerator",
+      new anchor.web3.PublicKey("1nc1nerator11111111111111111111111111111111"),
+    ],
+  ] as const) {
+    it(`rejects unauthorized redemption from a ${label}-authority receipt account`, async () => {
+      const lockedShares = await token.createAccount(
+        f.provider.connection,
+        f.payer,
+        SHARE_MINT,
+        owner,
+        anchor.web3.Keypair.generate()
+      );
+      await f.stake(100n, 100n, { to: lockedShares });
+      const before = await f.balance(f.other.tokens);
+      await rejectCode(
+        f.unstake(100n, 1n, {
+          from: lockedShares,
+          authority: f.other.signer,
+          to: f.other.tokens,
+        }),
+        "InvalidTokenAuthority"
+      );
+      assert.equal(await f.balance(lockedShares), 100n);
+      assert.equal(await f.balance(f.other.tokens), before);
+    });
+  }
+
+  it("reports a revoked underlying mint authority without panicking", async () => {
+    await token.setAuthority(
+      f.provider.connection,
+      f.payer,
+      TOKEN_MINT,
+      f.payer,
+      token.AuthorityType.MintTokens,
+      null
     );
-  });
-
-  let walletTokenAccount;
-  let walletXTokenAccount;
-
-  it('Mint test tokens', async () => {
-    walletTokenAccount = await mintObject.createAssociatedTokenAccount(provider.wallet.publicKey);
-    walletXTokenAccount = await xMintObject.createAssociatedTokenAccount(provider.wallet.publicKey);
-    await utils.mintToAccount(provider, mintPubkey, walletTokenAccount, 100_000_000_000);
-  });
-
-  it('Swap token for xToken', async () => {
-    await program.rpc.stake(
-      vaultBump,
-      new anchor.BN(5_000_000_000),
-      {
-        accounts: {
-          tokenMint: mintPubkey,
-          xTokenMint: xMintPubkey,
-          tokenFrom: walletTokenAccount,
-          tokenFromAuthority: provider.wallet.publicKey,
-          tokenVault: vaultPubkey,
-          xTokenTo: walletXTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        }
-      }
-    );
-    
-    assert.strictEqual(await getTokenBalance(walletTokenAccount), 95_000_000_000);
-    assert.strictEqual(await getTokenBalance(walletXTokenAccount), 5_000_000_000);
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 5_000_000_000);
-  });
-
-  it('Airdrop some tokens to the pool', async () => {
-    await utils.mintToAccount(provider, mintPubkey, vaultPubkey, 1_000_000_000);
-
-    assert.strictEqual(await getTokenBalance(walletTokenAccount), 95_000_000_000);
-    assert.strictEqual(await getTokenBalance(walletXTokenAccount), 5_000_000_000);
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 6_000_000_000);
-  });
-
-  it('Emit the price', async () => {
-    var res = await program.simulate.emitPrice(
-      {
-        accounts: {
-          tokenMint: mintPubkey,
-          xTokenMint: xMintPubkey,
-          tokenVault: vaultPubkey,
-        }
-      }
-    )
-    let price = res.events[0].data;
-    console.log('Emit price: ', price.stepPerXstepE9.toString());
-    console.log('Emit price: ', price.stepPerXstep.toString());
-    assert.strictEqual(price.stepPerXstep.toString(), '1.2');
-  });
-
-  it('Redeem xToken for token', async () => {
-    await program.rpc.unstake(
-      vaultBump,
-      new anchor.BN(5_000_000_000),
-      {
-        accounts: {
-          tokenMint: mintPubkey,
-          xTokenMint: xMintPubkey,
-          xTokenFrom: walletXTokenAccount,
-          xTokenFromAuthority: provider.wallet.publicKey,
-          tokenVault: vaultPubkey,
-          tokenTo: walletTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        }
-      }
-    );
-
-    assert.strictEqual(await getTokenBalance(walletTokenAccount), 101_000_000_000);
-    assert.strictEqual(await getTokenBalance(walletXTokenAccount), 0);
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 0);
-  });
-
-  it('Airdrop some tokens to the pool before xToken creation', async () => {
-    await utils.mintToAccount(provider, mintPubkey, vaultPubkey, 5_000_000_000);
-
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 5_000_000_000);
-  });
-
-  it('Swap token for xToken on prefilled pool', async () => {
-    await program.rpc.stake(
-      vaultBump,
-      new anchor.BN(5_000_000_000),
-      {
-        accounts: {
-          tokenMint: mintPubkey,
-          xTokenMint: xMintPubkey,
-          tokenFrom: walletTokenAccount,
-          tokenFromAuthority: provider.wallet.publicKey,
-          tokenVault: vaultPubkey,
-          xTokenTo: walletXTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        }
-      }
-    );
-    
-    assert.strictEqual(await getTokenBalance(walletTokenAccount), 96_000_000_000);
-    assert.strictEqual(await getTokenBalance(walletXTokenAccount), 5_000_000_000);
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 10_000_000_000);
-  });
-
-  it('Redeem xToken for token after prefilled pool', async () => {
-    await program.rpc.unstake(
-      vaultBump,
-      new anchor.BN(5_000_000_000),
-      {
-        accounts: {
-          tokenMint: mintPubkey,
-          xTokenMint: xMintPubkey,
-          xTokenFrom: walletXTokenAccount,
-          xTokenFromAuthority: provider.wallet.publicKey,
-          tokenVault: vaultPubkey,
-          tokenTo: walletTokenAccount,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        }
-      }
-    );
-
-    assert.strictEqual(await getTokenBalance(walletTokenAccount), 106_000_000_000);
-    assert.strictEqual(await getTokenBalance(walletXTokenAccount), 0);
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 0);
-  });
-
-  it('Can rescue ata funds if someone accidentally creates an ata off vault', async () => {
-    const badAta = NewToken.getAssociatedTokenAddressSync(mintPubkey, vaultPubkey, true);
-    const tx = new anchor.web3.Transaction().add(
-      await NewToken.createAssociatedTokenAccountInstruction(provider.wallet.publicKey, badAta, vaultPubkey, mintPubkey)
-    );
-    await provider.sendAndConfirm(tx);
-
-    await utils.mintToAccount(provider, mintPubkey, badAta, 1_000_000_000);
-    await program.methods.withdrawNested().accounts(
-      {
-          tokenMint: mintPubkey,
-          tokenVault: vaultPubkey,
-          refundee: provider.wallet.publicKey,
-          tokenVaultNestedAta: badAta,
-      }
-    ).rpc();
-
-    const ataA = await provider.connection.getAccountInfo(badAta);
-    assert.strictEqual(ataA, null);
-    assert.strictEqual(await getTokenBalance(vaultPubkey), 1_000_000_000);
-  });
-
-  it('exit because something weird is happening', async () => {
-    setTimeout(() => { exit(0); }, 1000);
+    await rejectCode(f.reclaim(), "MissingMintAuthority");
   });
 });
-
-async function getTokenBalance(pubkey) {
-  return parseInt((await provider.connection.getTokenAccountBalance(pubkey)).value.amount);
-}

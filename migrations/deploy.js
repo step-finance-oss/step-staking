@@ -1,51 +1,27 @@
-
-// Migrations are an early feature. Currently, they're nothing more than this
-// single deploy script that's invoked from the CLI, injecting a provider
-// configured from the workspace's Anchor.toml.
-
-const anchor = require("@coral-xyz/anchor");
+const anchor = require("@anchor-lang/core");
 const { TOKEN_PROGRAM_ID } = require("@solana/spl-token");
-const NewToken = require("new-spl-token");
-const fs = require('fs');
 
+// Creates only the configured vault; it does not create mints or set authorities.
+// Review the program ID, mint constants and provider before using a deployment.
 module.exports = async function (provider) {
-  // Configure client to use the provider.
   anchor.setProvider(provider);
-
-  let program = anchor.workspace.StepStaking;
-
-  let step = new anchor.web3.PublicKey("StepAscQoEioFxxWGnh2sLBDFp9d8rvKz2Yp39iDpyT");
-  let xStep = new anchor.web3.PublicKey("xStpgUCss9piqeFUk2iLVcvJEGhAdJxJQuwLkXP555G");
-
-  [vaultPubkey, vaultBump] =
-    await anchor.web3.PublicKey.findProgramAddress(
-      [step.toBuffer()],
-      program.programId
-    );
-    
-  const badAta = NewToken.getAssociatedTokenAddressSync(step, vaultPubkey, true);
-  
-  // await program.rpc.initialize(
-  //   vaultBump,
-  //   {
-  //     accounts: {
-  //       tokenMint: step,
-  //       xTokenMint: xStep,
-  //       tokenVault: vaultPubkey,
-  //       initializer: provider.wallet.publicKey,
-  //       systemProgram: anchor.web3.SystemProgram.programId,
-  //       tokenProgram: TOKEN_PROGRAM_ID,
-  //       rent: anchor.web3.SYSVAR_RENT_PUBKEY,
-  //     }
-  //   }
-  // );
-
-  await program.methods.withdrawNested().accounts(
-    {
-        tokenMint: step,
-        tokenVault: vaultPubkey,
-        refundee: provider.wallet.publicKey,
-        tokenVaultNestedAta: badAta,
-    }
-  ).rpc();
-}
+  const program = anchor.workspace.StepStaking;
+  const tokenMint = new anchor.web3.PublicKey(
+    "StepAscQoEioFxxWGnh2sLBDFp9d8rvKz2Yp39iDpyT"
+  );
+  const [tokenVault, bump] = anchor.web3.PublicKey.findProgramAddressSync(
+    [tokenMint.toBuffer()],
+    program.programId
+  );
+  await program.methods
+    .initialize(bump)
+    .accountsStrict({
+      tokenMint,
+      tokenVault,
+      initializer: provider.wallet.publicKey,
+      systemProgram: anchor.web3.SystemProgram.programId,
+      tokenProgram: TOKEN_PROGRAM_ID,
+      rent: anchor.web3.SYSVAR_RENT_PUBKEY,
+    })
+    .rpc();
+};

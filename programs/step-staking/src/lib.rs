@@ -5,7 +5,9 @@ use anchor_spl::{
     associated_token::AssociatedToken,
     token::{self, spl_token::instruction::AuthorityType, Mint, Token, TokenAccount},
 };
-use std::convert::TryInto;
+mod math;
+pub use math::price_for_totals;
+use math::{quote_stake, quote_unstake, token_authority};
 
 #[cfg(not(feature = "test-id"))]
 declare_id!("Stk5NCWomVN3itaFjLu382u9ibb5jMSHEsh6CuhaGjB");
@@ -40,12 +42,12 @@ pub mod step_staking {
     pub fn withdraw_nested(ctx: Context<WithdrawNested>) -> Result<()> {
         //compute vault signer seeds
         let token_mint_key = ctx.accounts.token_mint.key();
-        let seeds = &[token_mint_key.as_ref(), &[ctx.bumps["token_vault"]]];
+        let seeds = &[token_mint_key.as_ref(), &[ctx.bumps.token_vault]];
         let signer = &[&seeds[..]];
 
         //transfer from vault ata to vault
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            token::ID,
             token::Transfer {
                 from: ctx.accounts.token_vault_nested_ata.to_account_info(),
                 to: ctx.accounts.token_vault.to_account_info(),
@@ -57,7 +59,7 @@ pub mod step_staking {
 
         //close the token account
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            token::ID,
             token::CloseAccount {
                 account: ctx.accounts.token_vault_nested_ata.to_account_info(),
                 destination: ctx.accounts.refundee.to_account_info(),
@@ -72,76 +74,64 @@ pub mod step_staking {
 
     /// Set the mint authority of xSTEP to the mint authority of the STEP token
     /// This would be used for some rescue type operation, or deprecation of this program
-    /// After calling this operation with the correct keys (signed by the STEP mint auth)
-    /// This program would no longer function unless the mint authority were set
-    /// back to ANYxxG365hutGYaTdtUQG8u2hC4dFX9mFHKuzy9ABQJi
+    /// New deposits stop until the receipt mint authority is restored to the vault
+    /// PDA. Existing holders can still redeem. The reclaimed authority is trusted:
+    /// minting unbacked receipts would dilute every remaining holder.
     pub fn reclaim_mint_authority(ctx: Context<ReclaimMintAuthority>, nonce: u8) -> Result<()> {
+        let authority = Option::<Pubkey>::from(ctx.accounts.token_mint.mint_authority)
+            .ok_or(error!(StakingError::MissingMintAuthority))?;
+        require_keys_eq!(
+            authority,
+            ctx.accounts.authority.key(),
+            StakingError::InvalidAuthority
+        );
         let token_mint_key = ctx.accounts.token_mint.key();
         let seeds = &[token_mint_key.as_ref(), &[nonce]];
         let signer = [&seeds[..]];
 
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            token::ID,
             token::SetAuthority {
                 current_authority: ctx.accounts.token_vault.to_account_info(),
                 account_or_mint: ctx.accounts.x_token_mint.to_account_info(),
             },
             &signer,
         );
-        token::set_authority(
-            cpi_ctx,
-            AuthorityType::MintTokens,
-            Some(ctx.accounts.token_mint.mint_authority.unwrap()),
-        )?;
+        token::set_authority(cpi_ctx, AuthorityType::MintTokens, Some(authority))?;
         Ok(())
     }
 
-    pub fn stake(ctx: Context<Stake>, nonce: u8, amount: u64) -> Result<()> {
+    pub fn stake(ctx: Context<Stake>, nonce: u8, amount: u64, minimum_shares: u64) -> Result<()> {
         let total_token = ctx.accounts.token_vault.amount;
         let total_x_token = ctx.accounts.x_token_mint.supply;
+        token_authority(
+            ctx.accounts.token_from.owner,
+            Option::<Pubkey>::from(ctx.accounts.token_from.delegate),
+            ctx.accounts.token_from.delegated_amount,
+            ctx.accounts.token_from_authority.key(),
+            amount,
+        )?;
+        let shares = quote_stake(amount, total_token, total_x_token, minimum_shares)?;
         let old_price = get_price(&ctx.accounts.token_vault, &ctx.accounts.x_token_mint);
 
         let token_mint_key = ctx.accounts.token_mint.key();
         let seeds = &[token_mint_key.as_ref(), &[nonce]];
         let signer = [&seeds[..]];
 
-        //mint x tokens
-        if total_token == 0 || total_x_token == 0 {
-            //no math reqd, we mint them the amount they sent us
-            let cpi_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                token::MintTo {
-                    mint: ctx.accounts.x_token_mint.to_account_info(),
-                    to: ctx.accounts.x_token_to.to_account_info(),
-                    authority: ctx.accounts.token_vault.to_account_info(),
-                },
-                &signer,
-            );
-            token::mint_to(cpi_ctx, amount)?;
-        } else {
-            let what: u64 = (amount as u128)
-                .checked_mul(total_x_token as u128)
-                .unwrap()
-                .checked_div(total_token as u128)
-                .unwrap()
-                .try_into()
-                .unwrap();
-
-            let cpi_ctx = CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                token::MintTo {
-                    mint: ctx.accounts.x_token_mint.to_account_info(),
-                    to: ctx.accounts.x_token_to.to_account_info(),
-                    authority: ctx.accounts.token_vault.to_account_info(),
-                },
-                &signer,
-            );
-            token::mint_to(cpi_ctx, what)?;
-        }
+        let cpi_ctx = CpiContext::new_with_signer(
+            token::ID,
+            token::MintTo {
+                mint: ctx.accounts.x_token_mint.to_account_info(),
+                to: ctx.accounts.x_token_to.to_account_info(),
+                authority: ctx.accounts.token_vault.to_account_info(),
+            },
+            &signer,
+        );
+        token::mint_to(cpi_ctx, shares)?;
 
         //transfer the users tokens to the vault
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
+            token::ID,
             token::Transfer {
                 from: ctx.accounts.token_from.to_account_info(),
                 to: ctx.accounts.token_vault.to_account_info(),
@@ -165,14 +155,27 @@ pub mod step_staking {
         Ok(())
     }
 
-    pub fn unstake(ctx: Context<Unstake>, nonce: u8, amount: u64) -> Result<()> {
+    pub fn unstake(
+        ctx: Context<Unstake>,
+        nonce: u8,
+        amount: u64,
+        minimum_tokens: u64,
+    ) -> Result<()> {
         let total_token = ctx.accounts.token_vault.amount;
         let total_x_token = ctx.accounts.x_token_mint.supply;
+        token_authority(
+            ctx.accounts.x_token_from.owner,
+            Option::<Pubkey>::from(ctx.accounts.x_token_from.delegate),
+            ctx.accounts.x_token_from.delegated_amount,
+            ctx.accounts.x_token_from_authority.key(),
+            amount,
+        )?;
+        let payout = quote_unstake(amount, total_token, total_x_token, minimum_tokens)?;
         let old_price = get_price(&ctx.accounts.token_vault, &ctx.accounts.x_token_mint);
 
         //burn what is being sent
         let cpi_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
+            token::ID,
             token::Burn {
                 mint: ctx.accounts.x_token_mint.to_account_info(),
                 from: ctx.accounts.x_token_from.to_account_info(),
@@ -181,15 +184,6 @@ pub mod step_staking {
         );
         token::burn(cpi_ctx, amount)?;
 
-        //determine user share of vault
-        let what: u64 = (amount as u128)
-            .checked_mul(total_token as u128)
-            .unwrap()
-            .checked_div(total_x_token as u128)
-            .unwrap()
-            .try_into()
-            .unwrap();
-
         //compute vault signer seeds
         let token_mint_key = ctx.accounts.token_mint.key();
         let seeds = &[token_mint_key.as_ref(), &[nonce]];
@@ -197,7 +191,7 @@ pub mod step_staking {
 
         //transfer from vault to user
         let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
+            token::ID,
             token::Transfer {
                 from: ctx.accounts.token_vault.to_account_info(),
                 to: ctx.accounts.token_to.to_account_info(),
@@ -205,7 +199,7 @@ pub mod step_staking {
             },
             signer,
         );
-        token::transfer(cpi_ctx, what)?;
+        token::transfer(cpi_ctx, payout)?;
 
         ctx.accounts.token_vault.reload()?;
         ctx.accounts.x_token_mint.reload()?;
@@ -232,28 +226,11 @@ pub mod step_staking {
     }
 }
 
-const E9: u128 = 1000000000;
-
 pub fn get_price<'info>(
     vault: &Account<'info, TokenAccount>,
     mint: &Account<'info, Mint>,
 ) -> (u64, String) {
-    let total_token = vault.amount;
-    let total_x_token = mint.supply;
-
-    if total_x_token == 0 {
-        return (0, String::from("0"));
-    }
-
-    let price_uint = (total_token as u128)
-        .checked_mul(E9)
-        .unwrap()
-        .checked_div(total_x_token as u128)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let price_float = (total_token as f64) / (total_x_token as f64);
-    (price_uint, price_float.to_string())
+    price_for_totals(vault.amount, mint.supply)
 }
 
 #[derive(Accounts)]
@@ -333,11 +310,7 @@ pub struct ReclaimMintAuthority<'info> {
     )]
     pub token_vault: Box<Account<'info, TokenAccount>>,
 
-    #[account(
-        mut,
-        //only STEP's token authority can sign for this action
-        address = token_mint.mint_authority.unwrap(),
-    )]
+    #[account(mut)]
     ///the mint authority of the step token
     pub authority: Signer<'info>,
     pub token_program: Program<'info, Token>,
@@ -446,4 +419,31 @@ pub struct PriceChange {
 pub struct Price {
     pub step_per_xstep_e9: u64,
     pub step_per_xstep: String,
+}
+
+#[cfg(test)]
+mod tests;
+
+#[error_code]
+pub enum StakingError {
+    #[msg("Amount must be positive")]
+    InvalidAmount,
+    #[msg("Minimum output must be positive")]
+    InvalidMinimumOutput,
+    #[msg("Trade would produce zero output")]
+    ZeroOutput,
+    #[msg("Output is below the requested minimum")]
+    SlippageExceeded,
+    #[msg("Arithmetic result exceeds token limits")]
+    MathOverflow,
+    #[msg("Outstanding shares have no backing collateral")]
+    InvalidPoolState,
+    #[msg("Signer is not an authorized owner or delegate")]
+    InvalidTokenAuthority,
+    #[msg("Delegate allowance is insufficient")]
+    InsufficientDelegation,
+    #[msg("Underlying mint authority has been revoked")]
+    MissingMintAuthority,
+    #[msg("Signer is not the underlying mint authority")]
+    InvalidAuthority,
 }

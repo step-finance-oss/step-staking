@@ -5,3 +5,12 @@ target
 docker-target
 test-ledger
 .coderrect/
+
+.DS_Store
+.test-build
+coverage
+.env
+.env.*
+!.env.example
+**/*keypair.json
+/tests/keys

@@ -1,26 +1,29 @@
 [package]
 name = "step-staking"
-version = "0.1.1"
-description = "Created with Anchor"
-edition = "2018"
+version = "0.2.0"
+description = "Single-token staking vault with proportional receipt shares"
+edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
 name = "step_staking"
 
 [features]
+default = []
 no-entrypoint = []
 no-idl = []
+no-log-ix-name = []
 cpi = ["no-entrypoint"]
-
-#add to default for local testing
-#note, can also use `anchor test -- --feature local-testing,test-id` now
-#default = ["local-testing", "test-id"]
 local-testing = []
 test-id = []
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 
 [dependencies]
-anchor-lang = { version = "=0.28.0" }
-anchor-spl = "=0.28.0"
-spl-token = { version = "=4.0.0", features = ["no-entrypoint"] }
-uint = "=0.9.1" 
+anchor-lang = "=1.2.2"
+anchor-spl = "=1.2.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
