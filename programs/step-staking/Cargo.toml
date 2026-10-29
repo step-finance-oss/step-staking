@@ -1,0 +1,26 @@
+[package]
+name = "step-staking"
+version = "0.1.1"
+description = "Created with Anchor"
+edition = "2018"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "step_staking"
+
+[features]
+no-entrypoint = []
+no-idl = []
+cpi = ["no-entrypoint"]
+
+#add to default for local testing
+#note, can also use `anchor test -- --feature local-testing,test-id` now
+#default = ["local-testing", "test-id"]
+local-testing = []
+test-id = []
+
+[dependencies]
+anchor-lang = { version = "=0.28.0" }
+anchor-spl = "=0.28.0"
+spl-token = { version = "=4.0.0", features = ["no-entrypoint"] }
+uint = "=0.9.1" 

@@ -1,0 +1,28 @@
+[features]
+seeds = true
+skip-lint = false
+
+[workspace]
+members = ["programs/step-staking"]
+
+[registry]
+url = "https://anchor.projectserum.com"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 ./tests/**/*.ts"
+
+[programs.localnet]
+step_staking = "TesT35sGptoswsVkcLpUUe6U2iTJZE59on1Jno8Vdpg"
+
+[programs.devnet]
+step_staking = "Stk5NCWomVN3itaFjLu382u9ibb5jMSHEsh6CuhaGjB"
+
+[programs.testnet]
+step_staking = "Stk5NCWomVN3itaFjLu382u9ibb5jMSHEsh6CuhaGjB"
+
+[programs.mainnet]
+step_staking = "Stk5NCWomVN3itaFjLu382u9ibb5jMSHEsh6CuhaGjB"
